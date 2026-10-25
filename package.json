@@ -1,0 +1,48 @@
+{
+  "name": "runghost",
+  "version": "0.1.0",
+  "description": "Test on your real Postgres or Supabase database without saving anything.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./sql": "./sql/ghost.sql"
+  },
+  "files": [
+    "dist",
+    "sql"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@supabase/supabase-js": "^2"
+  },
+  "peerDependenciesMeta": {
+    "@supabase/supabase-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@types/node": "^22.19.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "dependencies": {
+    "postgres": "3.4.7"
+  },
+  "bin": {
+    "runghost": "dist/cli.js"
+  }
+}
