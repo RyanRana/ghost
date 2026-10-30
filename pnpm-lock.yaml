@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@supabase/supabase-js':
-        specifier: ^2
-        version: 2.118.0
       postgres:
         specifier: 3.4.7
         version: 3.4.7
@@ -18,6 +15,9 @@ importers:
       '@electric-sql/pglite':
         specifier: 0.5.8
         version: 0.5.8
+      '@supabase/supabase-js':
+        specifier: 2.118.0
+        version: 2.118.0
       '@types/node':
         specifier: ^22.19.0
         version: 22.20.5

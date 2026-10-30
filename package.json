@@ -41,6 +41,7 @@
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.8",
+    "@supabase/supabase-js": "2.118.0",
     "@types/node": "^22.19.0",
     "mysql2": "3.24.6",
     "typescript": "5.9.3",
