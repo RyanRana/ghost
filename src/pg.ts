@@ -1,7 +1,8 @@
 import type { Query } from "./call.js"
+import { createGhostDb } from "./db/engine.js"
+import { pgSingleSource, postgresDialect } from "./db/postgres.js"
 import type { GhostLog } from "./log/types.js"
 import type { GhostRowChange } from "./patch.js"
-import { sessionChanges } from "./write.js"
 
 export interface GhostPgOptions {
   /** Branch migrations to run first in every run, as { file, sql } (see prepareMigration / migrationLoader). */
@@ -17,47 +18,17 @@ export interface GhostPg {
   read(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>
 }
 
-/** Ghost on a plain Postgres connection. `client` must be one connection (a pool client, not the pool): the run is
- *  a real transaction on it that always rolls back, and the database refuses to commit it whatever happens. */
+/** Ghost on one plain Postgres connection (a pool client, not the pool), with a session log you already have.
+ *  For a URL or a pool, `connect()` is simpler. */
 export function ghostPg(client: { query: Query }, log: GhostLog, options: GhostPgOptions = {}): GhostPg {
-  const open = async (capture: boolean) => {
-    const [changes, migrations] = await Promise.all([sessionChanges(log), options.migrations?.() ?? []])
-    await client.query("begin")
-    await client.query("select ghost.open_run($1::text::jsonb, $2::text::jsonb, $3::boolean)",
-      [JSON.stringify(changes), migrations.length ? JSON.stringify(migrations) : null, capture])
-  }
-  const rollback = () => client.query("rollback").catch(() => {})
-
-  const transaction = async <T>(run: (query: Query) => Promise<T>, label: string) => {
-    await open(true)
-    try {
-      const result = await run((text, values) => client.query(text, values))
-      const { rows } = await client.query("select ghost.close_run() as changes")
-      const changes = (rows[0]?.changes ?? []) as GhostRowChange[]
-      await rollback()
-      if (changes.length) {
-        await log.addWrite({ kind: "sql", method: "SQL", target: "sql", path: "", headers: {}, body: label, changes })
-      }
-      return { result, changes }
-    } catch (error) {
-      await rollback()
-      throw error
-    }
-  }
-
+  const db = createGhostDb({ dialect: postgresDialect, source: pgSingleSource(client), log: () => log, migrations: options.migrations })
+  const session = db.session(log.id)
   return {
     async query(text, values) {
-      const { result, changes } = await transaction((q) => q(text, values), text)
-      return { rows: result.rows, changes }
+      const { rows, changes } = await session.query(text, values)
+      return { rows, changes }
     },
-    transaction: (run) => transaction(run, "transaction"),
-    async read(text, values) {
-      await open(false)
-      try {
-        return { rows: (await client.query(text, values)).rows }
-      } finally {
-        await rollback()
-      }
-    },
+    transaction: (run) => session.transaction(run),
+    read: (text, values) => session.read(text, values),
   }
 }

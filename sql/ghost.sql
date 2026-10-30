@@ -219,11 +219,12 @@ $function$;
 -- ---------------------------------------------------------------------------------------------------------------------
 -- Capture and replay guards
 
--- Captured only inside a run: the temp table exists nowhere else.
+-- Captured only inside a run: the temp table exists nowhere else. The key is the one the row had before the write (an
+-- update can change it; the new one is in the new image), so replay finds the row it changed.
 create or replace function ghost.capture_row()
 returns trigger language plpgsql security definer set search_path = '' as $function$
 declare
-  v_row jsonb := to_jsonb(coalesce(new, old));
+  v_row jsonb := case when tg_op = 'INSERT' then to_jsonb(new) else to_jsonb(old) end;
   v_pk jsonb;
 begin
   if pg_catalog.to_regclass('pg_temp.ghost_changes') is null then
@@ -243,6 +244,8 @@ $function$;
 
 -- Every public table with a primary key gets the capture trigger; real traffic pays one setting check per row.
 -- p_from/p_to bound the table names (inclusive, either open) so a big install can go in short batches.
+-- Its name sorts before any of yours, so a row is captured before what its triggers do: a parent before the child an
+-- AFTER trigger inserts for it, which is the order replay needs. (Older installs named it zz_ghost_capture.)
 create or replace function ghost.install_capture(p_from text default null, p_to text default null)
 returns jsonb language plpgsql security definer set search_path = '' as $function$
 declare
@@ -261,9 +264,13 @@ begin
       v_skipped := v_skipped || r.relname::text;
       continue;
     end if;
+    if exists (select 1 from pg_catalog.pg_trigger t where t.tgrelid = pg_catalog.format('public.%I', r.relname)::regclass
+               and t.tgname = 'zz_ghost_capture') then
+      execute pg_catalog.format('drop trigger zz_ghost_capture on public.%I', r.relname);
+    end if;
     if not exists (select 1 from pg_catalog.pg_trigger t where t.tgrelid = pg_catalog.format('public.%I', r.relname)::regclass
-                   and t.tgname = 'zz_ghost_capture') then
-      execute pg_catalog.format('create trigger zz_ghost_capture after insert or update or delete on public.%I for each row '
+                   and t.tgname = '0_ghost_capture') then
+      execute pg_catalog.format('create trigger "0_ghost_capture" after insert or update or delete on public.%I for each row '
         || 'when (pg_catalog.current_setting(''ghost.capture'', true) = ''on'') execute function ghost.capture_row()', r.relname);
       v_added := v_added + 1;
     end if;
@@ -342,39 +349,104 @@ returns text language sql stable security definer set search_path = '' as $funct
   from jsonb_object_keys(p_pk) k;
 $function$;
 
--- Exact row images back, in order, with every trigger skipped by the guard.
-create or replace function ghost.apply_changes(p_changes jsonb)
+-- One statement for a batch of rows of one table (the client plans batches, see plan.ts): insert them, update them by
+-- key and insert the missing ones, or delete them by key. A row whose key changed comes alone, and goes to apply_one.
+create or replace function ghost.apply_batch(p_table text, p_op text, p_rows jsonb)
+returns void language plpgsql security definer set search_path = '' as $function$
+declare
+  v_cols text[] := ghost.columns(p_table);
+  v_pk text[] := (select array_agg(k) from jsonb_object_keys(p_rows -> 0 -> 'pk') k);
+  v_list text := (select string_agg(pg_catalog.format('%I', c), ', ') from unnest(v_cols) c);
+  v_set text := (select string_agg(pg_catalog.format('%I = r.%I', c, c), ', ') from unnest(v_cols) c);
+  v_match text := (select string_agg(pg_catalog.format('x.%I = r.%I', k, k), ' and ') from unnest(v_pk) k);
+  v_images jsonb := (select jsonb_agg(e -> case when p_op = 'delete' then 'pk' else 'new' end) from jsonb_array_elements(p_rows) e);
+begin
+  if p_op = 'delete' then
+    execute pg_catalog.format('delete from public.%I x using jsonb_populate_recordset(null::public.%I, $1) r where %s',
+      p_table, p_table, v_match) using v_images;
+    return;
+  end if;
+  if p_op = 'upsert' then
+    execute pg_catalog.format('update public.%I x set %s from jsonb_populate_recordset(null::public.%I, $1) r where %s',
+      p_table, v_set, p_table, v_match) using v_images;
+  end if;
+  execute pg_catalog.format('insert into public.%I (%s) overriding system value select %s from jsonb_populate_recordset(null::public.%I, $1) r%s',
+    p_table, v_list, v_list, p_table,
+    case when p_op = 'upsert' then pg_catalog.format(' where not exists (select 1 from public.%I x where %s)', p_table, v_match) else '' end)
+    using v_images;
+end;
+$function$;
+
+-- One change exactly as captured. A row the session inserted must still have its key to itself: if a real row has
+-- taken it since, the session can't be put back, and that's said in plain words.
+create or replace function ghost.apply_one(c jsonb)
+returns void language plpgsql security definer set search_path = '' as $function$
+declare
+  v_table text := c ->> 'table';
+  v_cols text[] := ghost.columns(v_table);
+  v_list text := (select string_agg(pg_catalog.format('%I', col), ', ') from unnest(v_cols) col);
+  v_set text := (select string_agg(pg_catalog.format('%I = r.%I', col, col), ', ') from unnest(v_cols) col);
+  v_rows int;
+begin
+  if c ->> 'op' = 'DELETE' then
+    execute pg_catalog.format('delete from public.%I x where %s', v_table, ghost.pk_where(v_table, c -> 'pk'));
+  elsif c ->> 'op' = 'INSERT' then
+    execute pg_catalog.format('insert into public.%I (%s) overriding system value select %s from jsonb_populate_record(null::public.%I, $1) '
+      || 'on conflict do nothing', v_table, v_list, v_list, v_table) using c -> 'new';
+    get diagnostics v_rows = row_count;
+    if v_rows = 0 then
+      raise exception 'A real row in % now clashes with the row % this session inserted, so the session can''t be put back. Reset the session to start over. Nothing was saved.',
+        v_table, c -> 'pk' using errcode = 'GH409';
+    end if;
+  else
+    execute pg_catalog.format('update public.%I x set %s from jsonb_populate_record(null::public.%I, $1) r where %s',
+      v_table, v_set, v_table, ghost.pk_where(v_table, c -> 'pk')) using c -> 'new';
+    -- EXECUTE doesn't set FOUND.
+    get diagnostics v_rows = row_count;
+    if v_rows = 0 then
+      execute pg_catalog.format('insert into public.%I (%s) overriding system value select %s from jsonb_populate_record(null::public.%I, $1)',
+        v_table, v_list, v_list, v_table) using c -> 'new';
+    end if;
+  end if;
+end;
+$function$;
+
+-- The session's rows back, with every trigger skipped by the guard. With a plan, the fast way first (each row once,
+-- in batches); if a constraint refuses it, the exact way: every change, one at a time, in order.
+drop function if exists ghost.apply_changes(jsonb);
+create or replace function ghost.apply_changes(p_changes jsonb, p_plan jsonb default null)
 returns int language plpgsql security definer set search_path = '' as $function$
 declare
   c jsonb;
-  v_cols text[];
-  v_list text;
-  v_set text;
+  b jsonb;
   v_n int := 0;
-  v_rows int;
 begin
   perform ghost.replay_lock();
   if p_changes is null or jsonb_array_length(p_changes) = 0 then
     return 0;
   end if;
+  if p_plan is not null and jsonb_array_length(p_plan) > 0 then
+    begin
+      perform pg_catalog.set_config('ghost.replay', 'on', true);
+      for b in select value from jsonb_array_elements(p_plan) loop
+        c := p_changes -> ((b -> 'idx' ->> 0)::int);
+        if b ->> 'op' = 'upsert' and jsonb_array_length(b -> 'idx') = 1 and c ->> 'op' = 'UPDATE' then
+          -- One update on its own, which may have changed the row's key: found by the key it had.
+          perform ghost.apply_one(c);
+        else
+          perform ghost.apply_batch(b ->> 'table', b ->> 'op',
+            (select jsonb_agg(p_changes -> (i::int) order by o) from jsonb_array_elements_text(b -> 'idx') with ordinality as x(i, o)));
+        end if;
+      end loop;
+      perform pg_catalog.set_config('ghost.replay', 'off', true);
+      return jsonb_array_length(p_changes);
+    exception when integrity_constraint_violation then
+      -- The block's work is undone; the exact way follows.
+    end;
+  end if;
   perform pg_catalog.set_config('ghost.replay', 'on', true);
-  for c in select value from jsonb_array_elements(p_changes)
-  loop
-    if c ->> 'op' = 'DELETE' then
-      execute pg_catalog.format('delete from public.%I x where %s', c ->> 'table', ghost.pk_where(c ->> 'table', c -> 'pk'));
-    else
-      v_cols := ghost.columns(c ->> 'table');
-      select string_agg(pg_catalog.format('%I', col), ', '), string_agg(pg_catalog.format('%I = r.%I', col, col), ', ')
-        into v_list, v_set from unnest(v_cols) col;
-      execute pg_catalog.format('update public.%I x set %s from jsonb_populate_record(null::public.%I, $1) r where %s',
-        c ->> 'table', v_set, c ->> 'table', ghost.pk_where(c ->> 'table', c -> 'pk')) using c -> 'new';
-      -- EXECUTE doesn't set FOUND.
-      get diagnostics v_rows = row_count;
-      if v_rows = 0 then
-        execute pg_catalog.format('insert into public.%I (%s) overriding system value select %s from jsonb_populate_record(null::public.%I, $1)',
-          c ->> 'table', v_list, v_list, c ->> 'table') using c -> 'new';
-      end if;
-    end if;
+  for c in select value from jsonb_array_elements(p_changes) loop
+    perform ghost.apply_one(c);
     v_n := v_n + 1;
   end loop;
   perform pg_catalog.set_config('ghost.replay', 'off', true);
@@ -583,14 +655,16 @@ $function$;
 -- Opens a run in the caller's own transaction, for clients that hold a real connection (node-postgres, postgres.js):
 -- begin; select ghost.open_run(...); <your statements>; select ghost.close_run(); rollback;
 -- The replay marker goes in first, so that transaction can never commit even if the client tries.
-create or replace function ghost.open_run(p_changes jsonb default '[]', p_migrations jsonb default null, p_capture boolean default true)
+drop function if exists ghost.open_run(jsonb, jsonb, boolean);
+create or replace function ghost.open_run(p_changes jsonb default '[]', p_migrations jsonb default null, p_capture boolean default true,
+  p_plan jsonb default null)
 returns void language plpgsql security definer as $function$
 begin
   perform pg_catalog.set_config('lock_timeout', '200ms', true);
   perform ghost.replay_lock();
   create temp table if not exists ghost_changes (seq bigserial, tbl text, op text, pk jsonb, old_row jsonb, new_row jsonb) on commit drop;
   perform ghost.branch_migrations(p_migrations);
-  perform ghost.apply_changes(p_changes);
+  perform ghost.apply_changes(p_changes, p_plan);
   perform pg_catalog.set_config('ghost.capture', case when p_capture then 'on' else 'off' end, true);
 end;
 $function$;
@@ -625,7 +699,7 @@ begin
   perform pg_catalog.set_config('statement_timeout', '5s', true);
   begin
     perform pg_catalog.set_config('ghost.dispatch', ghost.dispatch_token(), true);
-    perform ghost.open_run(p_changes, p_request -> 'migrations', false);
+    perform ghost.open_run(p_changes, p_request -> 'migrations', false, p_request -> 'plan');
     perform pg_catalog.set_config('ghost.capture', 'on', true);
     v_result := case p_request ->> 'kind'
       when 'rpc' then ghost.call_rpc(p_request ->> 'name', p_request -> 'args')
@@ -657,7 +731,7 @@ begin
   perform pg_catalog.set_config('statement_timeout', '5s', true);
   begin
     perform pg_catalog.set_config('ghost.dispatch', ghost.dispatch_token(), true);
-    perform ghost.open_run(p_changes, p_request -> 'migrations', false);
+    perform ghost.open_run(p_changes, p_request -> 'migrations', false, p_request -> 'plan');
     v_out := jsonb_build_object('result', case p_request ->> 'kind'
       when 'rpc' then ghost.call_rpc(p_request ->> 'name', p_request -> 'args')
       -- Only the branch migrations: how the client asks whether a heavy one can get its lock yet.
@@ -752,9 +826,10 @@ $function$;
 
 revoke all on function
   ghost.install_counters(), ghost.install_capture(text, text), ghost.install_guards(text, text), ghost.install(text, text),
-  ghost.capture_row(), ghost.columns(text), ghost.pk_where(text, jsonb, text), ghost.apply_changes(jsonb),
+  ghost.capture_row(), ghost.columns(text), ghost.pk_where(text, jsonb, text), ghost.apply_changes(jsonb, jsonb),
+  ghost.apply_batch(text, text, jsonb), ghost.apply_one(jsonb),
   ghost.filter_sql(text, jsonb, text), ghost.call_rpc(text, jsonb), ghost.table_write(jsonb), ghost.table_read(jsonb),
-  ghost.deferred_checks(), ghost.branch_migrations(jsonb), ghost.open_run(jsonb, jsonb, boolean), ghost.close_run(),
+  ghost.deferred_checks(), ghost.branch_migrations(jsonb), ghost.open_run(jsonb, jsonb, boolean, jsonb), ghost.close_run(),
   public.ghost_run(jsonb, jsonb), public.ghost_read(jsonb, jsonb), public.ghost_relations(), public.ghost_applied_migrations(),
   public.ghost_log_add(text, text, jsonb), public.ghost_log_entries(text), public.ghost_log_reset(text), public.ghost_log_end(text)
   from public;

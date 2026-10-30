@@ -15,7 +15,7 @@ const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" }
 export function errorStatus(code: string): number {
   const pt = /^PT(\d{3})$/.exec(code)
   if (pt) return Number(pt[1])
-  if (code === "23505" || code === "23503" || code === "40001") return 409
+  if (code === "23505" || code === "23503" || code === "40001" || code === "GH409") return 409
   if (code === "42501") return 403
   if (code === "42883" || code === "PGRST202" || code === "PGRST205" || code === "42P01") return 404
   if (code === "57014") return 504

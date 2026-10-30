@@ -1,3 +1,16 @@
+// Any database: connect(url or driver) → sessions whose writes run for real and roll back.
+export { connect, dialectOf } from "./db/connect.js"
+export type { ConnectOptions } from "./db/connect.js"
+export { createGhostDb } from "./db/engine.js"
+export type { GhostDb, GhostDbOptions, GhostDbSession, Query as GhostQuery } from "./db/engine.js"
+export { GhostError, isGhostError } from "./db/errors.js"
+export type { GhostErrorCode } from "./db/errors.js"
+export { mysqlDialect } from "./db/mysql.js"
+export { postgresDialect } from "./db/postgres.js"
+export { sqliteDialect } from "./db/sqlite.js"
+export type { Check, Conn, ConnSource, Dialect, DialectName, Migration, RowChange } from "./db/types.js"
+
+// Supabase: a fetch that ghosts supabase-js, storage and edge functions, and holds outside sends.
 export { createGhost, databaseLog, memoryLog, sqliteLog } from "./engine.js"
 export type { Ghost, GhostOptions, GhostSession, LogFactory } from "./engine.js"
 export { ghostClient } from "./quick.js"

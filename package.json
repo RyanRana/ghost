@@ -1,7 +1,8 @@
 {
   "name": "runghost",
-  "version": "0.1.0",
-  "description": "Test on your real Postgres or Supabase database without saving anything.",
+  "version": "0.2.0",
+  "description": "Test on your real database without saving anything: Postgres, Supabase, MySQL, MariaDB and SQLite.",
+  "private": true,
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
@@ -26,16 +27,21 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "@supabase/supabase-js": "^2"
+    "@supabase/supabase-js": "^2",
+    "mysql2": "^3"
   },
   "peerDependenciesMeta": {
     "@supabase/supabase-js": {
+      "optional": true
+    },
+    "mysql2": {
       "optional": true
     }
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.8",
     "@types/node": "^22.19.0",
+    "mysql2": "3.24.6",
     "typescript": "5.9.3",
     "vitest": "4.1.12"
   },

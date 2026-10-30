@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import { GhostCallError, restCall, type GhostCall } from "./call.js"
+import { fastPlan } from "./db/plan.js"
 import { DatabaseGhostLog } from "./log/database.js"
 import { MemoryGhostLog } from "./log/memory.js"
 import { SqliteGhostLog } from "./log/sqlite.js"
@@ -122,9 +123,11 @@ export function createGhost(options: GhostOptions): Ghost {
 
   const dispatch: Dispatch = async (fn, changes, request) => {
     const migrations = migrationPayload(await branch())
+    // A long session goes back in batches; the database falls back to the exact way on its own when they don't fit.
+    const extra = { ...(migrations.length ? { migrations } : {}), ...(changes.length > 1 ? { plan: fastPlan(changes) } : {}) }
     let answer: Awaited<ReturnType<Dispatch>>
     try {
-      answer = (await call(fn, { p_changes: changes, p_request: migrations.length ? { ...(request as object), migrations } : request })) as typeof answer
+      answer = (await call(fn, { p_changes: changes, p_request: { ...(request as object), ...extra } })) as typeof answer
     } catch (e) {
       return { error: { code: (e as GhostCallError).code ?? "XX000", message: (e as Error).message } }
     }

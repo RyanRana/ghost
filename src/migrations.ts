@@ -32,13 +32,16 @@ export interface BranchMigrations {
 
 export const heavyNotice = (h: HeavyStatement) => `this migration ${h.does} ${h.table}, it may take a while`
 
+/** How a dialect quotes: MySQL adds backslash escapes, # comments and backticks; Postgres has dollar quotes. */
+export interface SqlSyntax { mysql?: boolean }
+
 /** Statements in order, split on semicolons outside quotes, comments and dollar-quoted bodies. */
-export function splitStatements(sql: string): string[] {
+export function splitStatements(sql: string, syntax: SqlSyntax = {}): string[] {
   const out: string[] = []
   let cur = "", i = 0
   while (i < sql.length) {
     const ch = sql[i]!, next = sql[i + 1]
-    if (ch === "-" && next === "-") {
+    if ((ch === "-" && next === "-") || (syntax.mysql && ch === "#")) {
       const end = sql.indexOf("\n", i)
       const stop = end < 0 ? sql.length : end
       cur += sql.slice(i, stop); i = stop
@@ -46,14 +49,15 @@ export function splitStatements(sql: string): string[] {
       const end = sql.indexOf("*/", i + 2)
       const stop = end < 0 ? sql.length : end + 2
       cur += sql.slice(i, stop); i = stop
-    } else if (ch === "'" || ch === '"') {
+    } else if (ch === "'" || ch === '"' || (syntax.mysql && ch === "`")) {
       let j = i + 1
       while (j < sql.length) {
+        if (syntax.mysql && sql[j] === "\\" && ch !== "`") { j += 2; continue }
         if (sql[j] === ch) { if (sql[j + 1] === ch) { j += 2; continue } break }
         j++
       }
       cur += sql.slice(i, j + 1); i = j + 1
-    } else if (ch === "$") {
+    } else if (ch === "$" && !syntax.mysql) {
       const tag = /^\$[A-Za-z_0-9]*\$/.exec(sql.slice(i))?.[0]
       if (tag) {
         const end = sql.indexOf(tag, i + tag.length)

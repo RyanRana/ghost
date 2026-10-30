@@ -1,6 +1,10 @@
+import { latestRows, pkKey } from "./db/plan.js"
 import { matches, type ParsedQuery } from "./query.js"
 
-/** One row a ghost click changed, exactly as the database's logic left it inside the rolled-back run. */
+export { latestRows }
+
+/** One row a ghost click changed, exactly as the database's logic left it inside the rolled-back run. `pk` is the key
+ *  the row had before the write (for an insert, the one it was given); an update that changed it has the new one in `new`. */
 export interface GhostRowChange {
   table: string
   op: "INSERT" | "UPDATE" | "DELETE"
@@ -10,19 +14,6 @@ export interface GhostRowChange {
 }
 
 type Row = Record<string, unknown>
-
-/** The latest image of every row the session touched, per table: null for a row it deleted. */
-export function latestRows(changes: readonly GhostRowChange[]): Map<string, Map<string, Row | null>> {
-  const out = new Map<string, Map<string, Row | null>>()
-  for (const c of changes) {
-    const rows = out.get(c.table) ?? new Map<string, Row | null>()
-    rows.set(pkKey(c.pk), c.op === "DELETE" ? null : c.new)
-    out.set(c.table, rows)
-  }
-  return out
-}
-
-const pkKey = (pk: Record<string, unknown>) => JSON.stringify(Object.keys(pk).sort().map((k) => [k, pk[k]]))
 
 function keyOf(row: Row, pkCols: readonly string[]): string | null {
   if (!pkCols.length || pkCols.some((c) => !(c in row))) return null

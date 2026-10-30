@@ -2,22 +2,26 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import { createInterface } from "node:readline"
 import { restCall } from "./call.js"
+import { connect, dialectOf } from "./db/connect.js"
+import type { GhostDb } from "./db/engine.js"
 import { SqliteGhostLog, openGhostFile } from "./log/sqlite.js"
-import { ghostPg } from "./pg.js"
 import { sessionSummary } from "./log/types.js"
 
 const HELP = `runghost: test on your real database without saving anything.
+Postgres, Supabase, MySQL, MariaDB and SQLite.
 
-  runghost init         ask for your keys, save them to .env.local, install ghost, check it works
-  runghost install      install or update ghost in the database (needs DATABASE_URL)
-  runghost doctor       check every piece is connected
-  runghost sql          print the install SQL (paste it into the Supabase SQL editor)
-  runghost query "<sql>"  run one statement in ghost and print { rows, changes } as JSON (--read for a read,
-                        --session <id> to keep it in a session; needs DATABASE_URL)
-  runghost sessions     list local sessions (.ghost/ghost.sqlite)
-  runghost reset <id>   forget one local session's changes
+  runghost init           ask for your database, save it to .env.local, install ghost, check it works
+  runghost install        install or update ghost in the database (SQLite needs nothing)
+  runghost doctor         check every piece is connected
+  runghost sql            print the Postgres install SQL (paste it into the Supabase SQL editor)
+  runghost query "<sql>"  run one statement in ghost and print { rows, changes } as JSON
+                          --read for a read, --session <id> to keep it in a session, --params '[1, "a"]'
+  runghost sessions       list local sessions (.ghost/ghost.sqlite)
+  runghost show <id>      every row one session changed, as JSON
+  runghost reset <id>     forget one local session's changes
 
-  Flags for agents and CI (no prompts): --url <supabase url> --key <service role key> --db <connection string> --yes
+  DATABASE_URL (or --db) is postgres://, mysql://, mariadb://, sqlite:<path> or a .db/.sqlite path.
+  Flags for agents and CI (no prompts): --db <url> --url <supabase url> --key <service role key> --yes
   Add --json to doctor and sessions for machine-readable output.`
 
 const SQL_PATH = new URL("../sql/ghost.sql", import.meta.url)
@@ -68,11 +72,13 @@ function ask(question: string, { secret = false, fallback = "" } = {}): Promise<
 const AGENT_NOTE = `
 ## Testing on the real database (ghost)
 
-This project has [ghost](https://github.com/RyanRana/ghost): writes run through the real database logic and are rolled back.
+This project has ghost (runghost): writes run through the real database logic and are rolled back.
 - Check it works: \`npx runghost doctor --json\`
 - One statement: \`npx runghost query "update ... returning *" --session agent-<task>\` prints the rows and every row it changed.
-- In code: \`const { db } = await (await import("runghost")).ghostClient("agent-<task>")\` is a Supabase client whose writes roll back
-  and whose reads see your session's earlier writes. Outside sends (email, Slack, payments) are held, never sent.
+  Later statements in the same session see those rows; nobody else does.
+- In code: \`const s = (await (await import("runghost")).connect(process.env.DATABASE_URL)).session("agent-<task>")\`, then
+  \`await s.query(sql, params)\` and \`await s.read(sql, params)\`. On Supabase, \`ghostClient("agent-<task>")\` gives a supabase-js
+  client instead, and outside sends (email, Slack, payments) are held, never sent.
 - Clean up: \`npx runghost reset agent-<task>\`. Prove changes in ghost before doing them for real; never work around a ghost refusal.
 `
 
@@ -101,31 +107,47 @@ function saveEnv(values: Record<string, string | undefined>) {
   if (missing.length) appendFileSync(".gitignore", `${ignore && !ignore.endsWith("\n") ? "\n" : ""}${missing.join("\n")}\n`)
 }
 
-async function install(db: string) {
-  const { default: postgres } = await import("postgres")
-  const sql = postgres(db, { max: 1, onnotice: () => {}, prepare: false })
+/** Ghost on DATABASE_URL, with sessions in the local file; closed when `run` is done. */
+async function withDb<T>(run: (ghost: GhostDb) => Promise<T>): Promise<T> {
+  const { db } = env()
+  if (!db) throw new Error("DATABASE_URL isn't set. Run `npx runghost init`, or pass --db <url>.")
+  const ghost = await connect(db, { log: (id) => new SqliteGhostLog(id, SESSION_FILE), pool: 1 })
   try {
-    await sql.unsafe(readFileSync(SQL_PATH, "utf8"))
-    const [row] = await sql.unsafe("select ghost.install() as report")
-    return row!.report as Record<string, any>
+    return await run(ghost)
   } finally {
-    await sql.end()
+    await ghost.close()
   }
+}
+
+/** One line for what an install did, whichever database it was. */
+function installSummary(report: Record<string, any>): string {
+  if (report.capture) {
+    const failed = [...(report.guards?.failed ?? []), ...(report.counters?.failed ?? [])]
+    return `installed: ${report.capture.added} capture triggers, ${report.guards.patched} guarded trigger functions, ${report.counters.twins} ghost counters`
+      + (failed.length ? `\ncould not rewrite: ${JSON.stringify(failed)}` : "")
+  }
+  if ("captured" in report) {
+    return `installed: capture on ${report.captured} tables, ${report.guarded} of your triggers guarded`
+      + (report.skippedNoPrimaryKey?.length ? `\nno primary key, so not captured: ${report.skippedNoPrimaryKey.join(", ")}` : "")
+      + (report.failed?.length ? `\ncould not guard: ${JSON.stringify(report.failed)}` : "")
+  }
+  return String(report.note ?? JSON.stringify(report))
 }
 
 type Check = { name: string; ok: boolean; detail: string }
 
 async function doctor(): Promise<Check[]> {
   const { url, key, db } = env()
-  // Plain Postgres needs only the connection string; Supabase needs the URL and key, and the string only to install.
+  // Any database needs only DATABASE_URL; Supabase also needs the URL and key for its API, and then DATABASE_URL only to install.
   const supabase = !!(url || key) || !db
+  const kind = db ? dialectOf(db) : null
   const checks: Check[] = supabase
     ? [
       { name: "SUPABASE_URL", ok: !!url, detail: url ?? "not set" },
       { name: "SUPABASE_SERVICE_ROLE_KEY", ok: !!key, detail: key ? "set" : "not set" },
       { name: "DATABASE_URL", ok: true, detail: db ? "set (used to install and for runghost query)" : "not set: install from the SQL editor with `runghost sql`" },
     ]
-    : [{ name: "DATABASE_URL", ok: true, detail: "set (plain Postgres: no Supabase keys needed)" }]
+    : [{ name: "DATABASE_URL", ok: !!kind, detail: kind ? `set (${kind})` : "not a postgres://, mysql://, mariadb:// or sqlite: URL" }]
   if (url && key) {
     const call = restCall(url, key)
     try {
@@ -137,24 +159,9 @@ async function doctor(): Promise<Check[]> {
       checks.push({ name: "ghost installed", ok: false, detail: `${(e as Error).message}. Run runghost install, then reload the API schema.` })
     }
   }
-  if (db) {
+  if (kind) {
     try {
-      const { default: postgres } = await import("postgres")
-      const sql = postgres(db, { max: 1, onnotice: () => {}, prepare: false })
-      try {
-        const [row] = await sql.unsafe(`select
-          (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace join pg_language l on l.oid = p.prolang
-            where n.nspname = 'public' and l.lanname = 'plpgsql' and p.prorettype = 'trigger'::regtype
-              and position('ghost.replay' in pg_get_functiondef(p.oid)) = 0)::int as unguarded,
-          (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'
-            and exists (select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary)
-            and not exists (select 1 from pg_trigger t where t.tgrelid = c.oid and t.tgname = 'zz_ghost_capture'))::int as uncaptured`)
-        const stale = Number(row!.unguarded) + Number(row!.uncaptured)
-        checks.push({ name: "install is current", ok: stale === 0,
-          detail: stale ? `${row!.unguarded} trigger functions and ${row!.uncaptured} tables are new since the last install: run runghost install` : "every table and trigger function is covered" })
-      } finally {
-        await sql.end()
-      }
+      checks.push(...(await withDb((ghost) => ghost.doctor())).checks)
     } catch (e) {
       const err = e as Error & { code?: string }
       checks.push({ name: "database connection", ok: false, detail: err.message || err.code || String(e) })
@@ -174,32 +181,36 @@ async function main() {
   switch (command) {
     case "init": {
       const current = env()
-      console.log("ghost setup. Keys are saved to .env.local, which is kept out of git.\n")
-      console.log("Supabase: Project Settings → API (URL, service_role key) and → Database (connection string).\n")
-      const url = await ask("Supabase project URL", { fallback: current.url ?? "" })
-      const key = await ask("Service role key", { secret: true, fallback: current.key ?? "" })
-      const db = await ask("Database connection string (only to install; blank to use the SQL editor)", { secret: true, fallback: current.db ?? "" })
+      console.log("ghost setup. Everything is saved to .env.local, which is kept out of git.\n")
+      const db = await ask("Database URL (postgres://, mysql://, mariadb://, sqlite:./app.db; blank for Supabase's SQL editor)",
+        { secret: true, fallback: current.db ?? "" })
+      if (db && !dialectOf(db)) throw new Error("That isn't a postgres://, mysql://, mariadb:// or sqlite: URL.")
+      let url = current.url ?? "", key = current.key ?? ""
+      if (!db || dialectOf(db) === "postgres") {
+        console.log("\nOn Supabase? Project Settings → API has the URL and service_role key (for ghostClient). Leave blank otherwise.\n")
+        url = await ask("Supabase project URL", { fallback: url })
+        key = url ? await ask("Service role key", { secret: true, fallback: key }) : ""
+      }
       saveEnv({ SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: key, DATABASE_URL: db })
       process.env.SUPABASE_URL = url
       process.env.SUPABASE_SERVICE_ROLE_KEY = key
       if (db) process.env.DATABASE_URL = db
-      if (db && await yes("Install ghost into this database now? It adds a ghost schema, a capture trigger per table and a two-line guard per trigger function")) {
-        const report = await install(db)
-        console.log(`installed: ${report.capture.added} capture triggers, ${report.guards.patched} guarded trigger functions, ${report.counters.twins} ghost counters`)
-        if (report.guards.failed.length || report.counters.failed.length) console.log("could not rewrite:", JSON.stringify([...report.guards.failed, ...report.counters.failed]))
+      const what = { postgres: "a ghost schema, a capture trigger per table and a two-line guard per trigger function",
+        mysql: "two _ghost_ tables, capture triggers per table and a guard in each of your triggers", sqlite: "" }[dialectOf(db) ?? "postgres"]
+      if (db && what && await yes(`Install ghost into this database now? It adds ${what}`)) {
+        console.log(installSummary(await withDb((ghost) => ghost.install())))
       } else if (!db) {
         console.log("\nPaste the output of `npx runghost sql` into the Supabase SQL editor, then run: select ghost.install();")
       }
       if (await yes("Add a short ghost note to this project's AGENTS.md so coding agents use it")) console.log(addAgentNote())
       console.log("")
       printChecks(await doctor())
-      console.log('\nTry it: npx runghost query "select now()"')
+      console.log('\nTry it: npx runghost query "select 1"')
       return
     }
     case "install": {
-      const { db } = env()
-      if (!db) throw new Error("DATABASE_URL isn't set. Run runghost init, or paste `runghost sql` into the SQL editor.")
-      console.log(JSON.stringify(await install(db), null, 2))
+      const report = await withDb((ghost) => ghost.install())
+      console.log(json ? JSON.stringify(report, null, 2) : installSummary(report))
       return
     }
     case "doctor": {
@@ -213,22 +224,27 @@ async function main() {
       return
     case "query": {
       const text = rest[0]
-      const { db } = env()
       if (!text) throw new Error('What should run? runghost query "<sql>"')
-      if (!db) throw new Error("DATABASE_URL isn't set. Run npx runghost init.")
-      const { default: postgres } = await import("postgres")
-      const sql = postgres(db, { max: 1, onnotice: () => {}, prepare: false })
-      const connection = await sql.reserve()
-      try {
-        const query = async (q: string, values: unknown[] = []) => ({ rows: [...(await connection.unsafe(q, values as never[]))] as Record<string, unknown>[] })
-        const id = flag("session")
-        const pg = ghostPg({ query }, id ? new SqliteGhostLog(id, SESSION_FILE) : new (await import("./log/memory.js")).MemoryGhostLog("once"))
-        const out = has("read") ? await pg.read(text) : await pg.query(text)
-        console.log(JSON.stringify(out, null, 2))
-      } finally {
-        connection.release()
-        await sql.end()
-      }
+      const params = flag("params") ? JSON.parse(flag("params")!) as unknown[] : []
+      if (!Array.isArray(params)) throw new Error("--params is a JSON array, e.g. --params '[1, \"a\"]'")
+      const id = flag("session")
+      const out = await withDb(async (ghost) => {
+        // Without --session the statement runs in a throwaway session nobody keeps.
+        const session = ghost.session(id ?? `once-${process.pid}`)
+        try {
+          return has("read") ? await session.read(text, params) : await session.query(text, params)
+        } finally {
+          if (!id) await session.end()
+        }
+      })
+      console.log(JSON.stringify(out, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2))
+      return
+    }
+    case "show": {
+      const id = rest[0]
+      if (!id) throw new Error("Which session? runghost show <id> (see runghost sessions)")
+      if (!existsSync(SESSION_FILE)) throw new Error("No local sessions yet.")
+      console.log(JSON.stringify((await new SqliteGhostLog(id, SESSION_FILE).writes()).flatMap((w) => w.changes ?? []), null, 2))
       return
     }
     case "sessions": {

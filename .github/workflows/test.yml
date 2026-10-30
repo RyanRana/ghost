@@ -3,6 +3,24 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ghost
+          MYSQL_DATABASE: shop
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -pghost" --health-interval 5s --health-timeout 5s --health-retries 20
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: ghost
+          MARIADB_DATABASE: shop
+        ports: ["3307:3306"]
+        options: --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      MYSQL_URL: mysql://root:ghost@127.0.0.1:3306/shop
+      MARIADB_URL: mysql://root:ghost@127.0.0.1:3307/shop
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
