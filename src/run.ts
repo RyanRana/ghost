@@ -1,7 +1,9 @@
 import { dispatcherFilters, parseQuery, type ParsedQuery } from "./query.js"
 import { latestRows, patchRows, touchedTables, type GhostRowChange } from "./patch.js"
+import type { Reaches } from "./reach.js"
 
-export interface Relation { kind: "table" | "view"; pk: string[] }
+export interface ForeignKey { name: string; table: string; columns: string[]; refColumns: string[] }
+export interface Relation { kind: "table" | "view"; pk: string[]; fks?: ForeignKey[] }
 export type Relations = Record<string, Relation>
 
 type Json = unknown
@@ -61,7 +63,9 @@ export async function writeRequest(request: Request, relations: Relations): Prom
   const prefer = request.headers.get("prefer") ?? ""
   if (request.method === "POST" || request.method === "PUT") {
     const upsert = request.method === "PUT" || /resolution=(merge|ignore)-duplicates/.test(prefer)
-    const onConflict = url.searchParams.get("on_conflict")?.split(",") ?? relations[q.table]?.pk ?? []
+    // Left out or empty ("?on_conflict="), PostgREST uses the primary key.
+    const named = url.searchParams.get("on_conflict")?.split(",").filter(Boolean) ?? []
+    const onConflict = named.length ? named : relations[q.table]?.pk ?? []
     return { request: { kind: "table", table: q.table, method: upsert ? "upsert" : "insert", body: await bodyJson(request),
       onConflict, ignoreDuplicates: /resolution=ignore-duplicates/.test(prefer) } }
   }
@@ -91,22 +95,38 @@ export type Dispatch = (fn: "ghost_run" | "ghost_read", changes: GhostRowChange[
 /** A read in a session that has changes: replayed in the database when it can be run as written (views, RPCs, plain
  *  table reads), else read live and patched with the session's rows. Null means read live as usual. */
 export async function ghostRead(
-  request: Request, changes: GhostRowChange[], relations: Relations, dispatch: Dispatch, live: () => Promise<Response>,
-  branch: { tables: Set<string> } | null = null,
+  request: Request, changes: GhostRowChange[], relations: Relations, dispatch: Dispatch, live: (asked?: Request) => Promise<Response>,
+  branch: { tables: Set<string> } | null = null, reach: Reaches | null = null,
 ): Promise<Response | null> {
   // With branch migrations every read is replayed: PostgREST's schema cache can't see what they add.
   if (!changes.length && !branch) return null
   const url = new URL(request.url)
+  // Another table's rows as this session sees them, for filling the embeds of a row the session added.
+  const reader: ReadRows = async (path) => {
+    const headers = new Headers({ accept: "application/json" })
+    for (const name of ["apikey", "authorization", "accept-profile"]) {
+      const value = request.headers.get(name)
+      if (value) headers.set(name, value)
+    }
+    const asked = new Request(new URL(`/rest/v1/${path}`, url), { headers })
+    const response = (await ghostRead(asked, changes, relations, dispatch, (again) => live(again ?? asked), branch, reach)) ?? await live(asked)
+    if (!response.ok) throw new Error(`${path.split("?")[0]} ${response.status}`)
+    return await response.json() as Row[]
+  }
   const rpc = RPC.exec(url.pathname)
   if (rpc) {
-    const answer = await dispatch("ghost_read", changes, { kind: "rpc", name: decodeURIComponent(rpc[1]!), args: rpcArgsFromQuery(url) })
+    const name = decodeURIComponent(rpc[1]!)
+    // A function that can't reach anything the session changed reads exactly what live reads.
+    if (!branch && !seesSession(reach?.("function", name), changes)) return null
+    const answer = await dispatch("ghost_read", changes, { kind: "rpc", name, args: rpcArgsFromQuery(url) })
     return answer.error ? errorResponse(answer.error) : shaped(request, 200, answer.result ?? null)
   }
   if (!TABLE.test(url.pathname)) return null
   const q = parseQuery(url)
   const relation = relations[q.table]
   const touched = new Set(changes.map((c) => c.table))
-  const hit = !!branch || relation?.kind === "view" || touchedTables(q).some((t) => touched.has(t))
+  const hit = !!branch || (relation?.kind === "view" && seesSession(reach?.("view", q.table), changes))
+    || touchedTables(q).some((t) => touched.has(t))
   if (!hit) return null
   const counted = /count=/.test(request.headers.get("prefer") ?? "")
   const filters = dispatcherFilters(q)
@@ -123,21 +143,85 @@ export async function ghostRead(
       + "(plain columns, eq/neq/in/is/gt/gte/lt/lte filters, no embeds or counts) run against it.")
   }
   if (relation?.kind === "view" || !changes.length) return null
-  return patchLive(request, q, changes, relations, live)
+  return patchLive(request, q, changes, relations, live, reader)
+}
+
+/** Whether a function or view can read a row the session changed. Not knowing what it reads counts as yes. */
+export function seesSession(within: ReadonlySet<string> | null | undefined, changes: readonly GhostRowChange[]): boolean {
+  return !within || changes.some((change) => within.has(change.table))
+}
+
+type ReadRows = (path: string) => Promise<Row[]>
+type Row = Record<string, unknown>
+
+const inList = (values: unknown[]) => `in.(${values.map((value) => typeof value === "number" ? value : `"${String(value).replace(/"/g, '\\"')}"`).join(",")})`
+
+/** The embeds of rows the session added, which live cannot join: each is read from its own table through the foreign
+ *  key PostgREST would have followed. One it can't place (no single matching key) stays null. */
+async function fillEmbeds(added: { row: Row; image: Row }[], q: ParsedQuery, relations: Relations, read: ReadRows): Promise<void> {
+  for (const embed of q.embeds) {
+    const named = (fk: ForeignKey) => !embed.hint || fk.name === embed.hint || fk.columns[0] === embed.hint
+    const single = (fk: ForeignKey) => fk.columns.length === 1 && fk.refColumns.length === 1
+    // `alias:table(...)`, or the foreign key itself: `alias:fk_column(...)` and `alias:constraint(...)`.
+    const toOne = (relations[q.table]?.fks ?? []).filter(single)
+      .filter((fk) => fk.table === embed.table || fk.columns[0] === embed.table || fk.name === embed.table).filter(named)
+    const toMany = (embed.table ? relations[embed.table]?.fks ?? [] : []).filter(single).filter((fk) => fk.table === q.table).filter(named)
+    for (const { row } of added) row[embed.key] = null
+    const fk = toOne.length === 1 && !toMany.length ? toOne[0]! : toMany.length === 1 && !toOne.length ? toMany[0]! : null
+    if (!fk || embed.select === undefined) continue
+    const one = fk === toOne[0]
+    const [mine, theirs, table] = one ? [fk.columns[0]!, fk.refColumns[0]!, fk.table] : [fk.refColumns[0]!, fk.columns[0]!, embed.table!]
+    const values = [...new Set(added.map(({ image }) => image[mine]).filter((value) => value != null))]
+    if (!one) for (const { row } of added) row[embed.key] = []
+    if (!values.length) continue
+    const selected = embed.select === "*" || embed.select.split(",").map((part) => part.trim()).includes(theirs)
+    try {
+      const found = await read(`${table}?select=${encodeURIComponent(selected ? embed.select : `${embed.select},${theirs}`)}&${theirs}=${encodeURIComponent(inList(values))}`)
+      const shown = (item: Row) => selected ? item : Object.fromEntries(Object.entries(item).filter(([key]) => key !== theirs))
+      for (const { row, image } of added) {
+        const matched = found.filter((item) => String(item[theirs]) === String(image[mine])).map(shown)
+        row[embed.key] = one ? matched[0] ?? null : matched
+      }
+    } catch (error) {
+      console.error(`[ghost] could not fill ${q.table}.${embed.key} for a row the session added`, error)
+    }
+  }
 }
 
 async function patchLive(request: Request, q: ParsedQuery, changes: GhostRowChange[], relations: Relations,
-  live: () => Promise<Response>): Promise<Response> {
-  const response = await live()
+  live: (asked?: Request) => Promise<Response>, read?: ReadRows): Promise<Response> {
+  const pkOf = (t: string) => relations[t]?.pk ?? ["id"]
+  // Live answers a one-row request with an error when the row is only in the session, and a select without the
+  // primary key can't be matched to the session's rows: ask for the rows, with their key, and shape the answer here.
+  const object = wantsObject(request)
+  const missing = q.plain && q.columns ? pkOf(q.table).filter((column) => !q.columns!.includes(column)) : []
+  let asked: Request | undefined
+  if (object || missing.length) {
+    const url = new URL(request.url)
+    if (missing.length) url.searchParams.set("select", [...q.columns!, ...missing].join(","))
+    const headers = new Headers(request.headers)
+    if (object) headers.set("accept", "application/json")
+    asked = new Request(url, { method: request.method, headers })
+  }
+  const response = await live(asked)
   if (!response.ok) return response
   const text = await response.text()
   let body: unknown
   try { body = JSON.parse(text) } catch { return new Response(text, { status: response.status, headers: response.headers }) }
-  if (body == null && !wantsObject(request)) return new Response(text, { status: response.status, headers: response.headers })
-  const latest = latestRows(changes)
-  const pkOf = (t: string) => relations[t]?.pk ?? ["id"]
+  if (body == null && !object) return new Response(text, { status: response.status, headers: response.headers })
   const single = !Array.isArray(body)
-  const rows = patchRows((single ? (body == null ? [] : [body]) : body) as Record<string, unknown>[], q, latest, pkOf)
+  const added: { row: Row; image: Row }[] = []
+  let patched = patchRows((single ? (body == null ? [] : [body]) : body) as Row[], q, latestRows(changes), pkOf,
+    q.embeds.length && read ? added : undefined)
+  if (added.length && read) {
+    await fillEmbeds(added, q, relations, read)
+    // An inner join drops a row with nothing on the other side.
+    const empty = (value: unknown) => value == null || (Array.isArray(value) && !value.length)
+    const dropped = new Set(added.filter(({ row }) => q.embeds.some((embed) => embed.inner && empty(row[embed.key]))).map(({ row }) => row))
+    if (dropped.size) patched = patched.filter((row) => !dropped.has(row))
+  }
+  const rows = missing.length ? patched.map((row) => Object.fromEntries(q.columns!.map((column) => [column, row[column] ?? null]))) : patched
+  if (object) return shaped(request, 200, rows)
   const out = single ? rows[0] ?? null : rows
   const headers = new Headers(response.headers)
   headers.delete("content-length")

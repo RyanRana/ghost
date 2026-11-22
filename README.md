@@ -55,6 +55,15 @@ every run:
 - puts a long session back in batches, and row by row when a constraint needs the exact order
 - says so when a real row now clashes with one the session inserted, instead of showing the wrong one
 
+reads (supabase):
+- a function or view that can't reach anything the session changed is read live, no replay (`ghost_read_reach` maps what each one names; anything it can't tell is replayed)
+- a function whose every overload is STABLE or IMMUTABLE runs as a read, not a write
+- a row the session added joins reads that embed other tables, by their foreign keys, and lands where the order says
+- cs filters and json paths are evaluated against the session's rows
+- the database session log fetches only what's new
+
+run `runghost install` again after upgrading: it adds the new functions.
+
 mysql saves ddl the moment it runs, so ghost refuses it there. sqlite numbers rows without AUTOINCREMENT from the
 highest one, so a real insert can reuse a ghost row's id; ghost tells you when it does.
 

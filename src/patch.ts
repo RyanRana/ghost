@@ -1,5 +1,5 @@
 import { latestRows, pkKey } from "./db/plan.js"
-import { matches, type ParsedQuery } from "./query.js"
+import { matches, sortRows, type ParsedQuery } from "./query.js"
 
 export { latestRows }
 
@@ -27,6 +27,9 @@ const project = (row: Row, columns: readonly string[] | null) =>
  *  inserted ones join when the query's filters can be evaluated exactly. Embedded rows get the same by primary key. */
 export function patchRows(
   rows: Row[], q: ParsedQuery, changes: Map<string, Map<string, Row | null>>, pkOf: (table: string) => readonly string[],
+  /** Given, a read with embeds takes the session's inserted rows too: each is listed here with its whole image, for the
+   *  caller to fill its embeds from. */
+  added?: { row: Row; image: Row }[],
 ): Row[] {
   const own = changes.get(q.table)
   const pkCols = pkOf(q.table)
@@ -42,12 +45,19 @@ export function patchRows(
     for (const e of q.embeds) next = patchEmbed(next, e.key, e.table, changes, pkOf)
     out.push(next)
   }
-  if (own && q.evaluable && q.embeds.length === 0) {
+  // A row the session changed may sit somewhere else in the order now, like one it added.
+  let moved = rows.some((row) => { const key = keyOf(row, pkCols); return !!key && !!own?.get(key) })
+  if (own && q.evaluable && (q.embeds.length === 0 || added)) {
     for (const [key, ghost] of own) {
-      if (ghost && !seen.has(key) && matches(ghost, q.conditions)) out.push(project(ghost, q.columns))
+      if (!ghost || seen.has(key) || !matches(ghost, q.conditions)) continue
+      const row = { ...project(ghost, q.columns) }
+      out.push(row)
+      added?.push({ row, image: ghost })
+      moved = true
     }
   }
-  return q.limit != null ? out.slice(0, q.limit) : out
+  const ordered = moved ? sortRows(out, q.order) : out
+  return q.limit != null ? ordered.slice(0, q.limit) : ordered
 }
 
 // Only the columns the row came back with: a narrow select stays narrow.

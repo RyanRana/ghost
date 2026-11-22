@@ -748,15 +748,99 @@ begin
 end;
 $function$;
 
--- What the read patcher needs: every public table and view, with primary keys.
+-- What the read patcher needs: every public table and view, with primary keys and foreign keys (so a row the session
+-- added can join a read that embeds another table: live can't join a row it doesn't have).
 create or replace function public.ghost_relations()
 returns jsonb language sql stable security definer set search_path = '' as $function$
   select coalesce(jsonb_object_agg(c.relname, jsonb_build_object('kind', case c.relkind when 'v' then 'view' when 'm' then 'view' else 'table' end,
     'pk', coalesce((select jsonb_agg(a.attname order by array_position(i.indkey, a.attnum))
       from pg_catalog.pg_index i join pg_catalog.pg_attribute a on a.attrelid = i.indrelid and a.attnum = any (i.indkey)
-      where i.indrelid = c.oid and i.indisprimary), '[]'::jsonb))), '{}'::jsonb)
+      where i.indrelid = c.oid and i.indisprimary), '[]'::jsonb),
+    'fks', coalesce((select jsonb_agg(jsonb_build_object('name', k.conname, 'table', t.relname,
+        'columns', (select jsonb_agg(a.attname order by x.ord) from unnest(k.conkey) with ordinality x(attnum, ord)
+          join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = x.attnum),
+        'refColumns', (select jsonb_agg(a.attname order by x.ord) from unnest(k.confkey) with ordinality x(attnum, ord)
+          join pg_catalog.pg_attribute a on a.attrelid = k.confrelid and a.attnum = x.attnum)) order by k.conname)
+      from pg_catalog.pg_constraint k
+      join pg_catalog.pg_class t on t.oid = k.confrelid
+      join pg_catalog.pg_namespace tn on tn.oid = t.relnamespace
+      where k.conrelid = c.oid and k.contype = 'f' and tn.nspname = 'public'), '[]'::jsonb))), '{}'::jsonb)
   from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
   where n.nspname = 'public' and c.relkind in ('r', 'p', 'v', 'm');
+$function$;
+
+-- The public functions whose every overload is STABLE or IMMUTABLE: they can't change the database, so ghost runs
+-- them as reads instead of setting up capture for a write. PostgREST runs these in a read-only transaction too.
+create or replace function public.ghost_read_functions()
+returns jsonb language sql stable security definer set search_path = '' as $function$
+  select coalesce(jsonb_agg(f.proname order by f.proname), '[]'::jsonb)
+  from (
+    select p.proname
+    from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.prokind = 'f'
+    group by p.proname
+    having bool_and(p.provolatile <> 'v')
+  ) f;
+$function$;
+
+-- What each function, view and row-level policy names: the functions it calls (a name followed by a parenthesis) and
+-- the relations whose names appear in it. Ghost follows this from an RPC or a view to every table it can reach, and
+-- answers live when the session changed none of them. It errs wide (a name in a comment counts). A function that
+-- builds SQL at run time (EXECUTE), one in any language but SQL or PL/pgSQL, or one whose body isn't kept as text
+-- (BEGIN ATOMIC) is opaque, and anything that reaches one is replayed.
+create or replace function public.ghost_read_reach()
+returns jsonb language sql stable security definer set search_path = '' as $function$
+  with scope as materialized (
+    select n.oid from pg_catalog.pg_namespace n
+    where n.nspname !~ '^pg_' and n.nspname not in ('information_schema', 'ghost', 'extensions', 'graphql', 'graphql_public', 'vault',
+      'pgsodium', 'pgsodium_masks', 'net', 'cron', 'realtime', 'supabase_functions', 'supabase_migrations', 'pgbouncer', 'storage', 'auth')
+  ),
+  rel as materialized (
+    select c.relname::text collate "C" as name,
+      replace(concat_ws(' ',
+        string_agg(case when c.relkind = 'v' then pg_catalog.pg_get_viewdef(c.oid) end, ' '),
+        string_agg((select string_agg(concat_ws(' ', pg_catalog.pg_get_expr(po.polqual, po.polrelid),
+          pg_catalog.pg_get_expr(po.polwithcheck, po.polrelid)), ' ') from pg_catalog.pg_policy po where po.polrelid = c.oid), ' ')),
+        '"', '') as src
+    from pg_catalog.pg_class c
+    where c.relnamespace in (select s.oid from scope s) and c.relkind in ('r', 'p', 'v', 'm', 'f')
+    group by 1
+  ),
+  fn as materialized (
+    select p.proname::text collate "C" as name,
+      replace(string_agg(coalesce(p.prosrc, ''), ' '), '"', '') as src,
+      bool_or(l.lanname not in ('sql', 'plpgsql') or coalesce(p.prosrc, '') = ''
+        or (l.lanname = 'plpgsql' and p.prosrc ~* '\mexecute\M')) as opaque
+    from pg_catalog.pg_proc p join pg_catalog.pg_language l on l.oid = p.prolang
+    where p.pronamespace in (select s.oid from scope s)
+    group by 1
+  ),
+  body as materialized (
+    select 'f' as kind, f.name, f.src from fn f
+    union all
+    select 'r', r.name, r.src from rel r where r.src <> ''
+  ),
+  calls as (
+    select distinct b.kind, b.name, lower(m[1])::text collate "C" as word
+    from body b cross join lateral pg_catalog.regexp_matches(b.src, '([A-Za-z_][A-Za-z0-9_$]*)\s*\(', 'g') m
+  ),
+  words as (
+    select distinct b.kind, b.name, lower(m[1])::text collate "C" as word
+    from body b cross join lateral pg_catalog.regexp_matches(b.src, '([A-Za-z_][A-Za-z0-9_$]*)', 'g') m
+  ),
+  edges as (
+    select c.kind, c.name, 'f:' || f.name as target from calls c join fn f on lower(f.name) = c.word
+    where not (c.kind = 'f' and f.name = c.name)
+    union
+    select w.kind, w.name, 'r:' || r.name from words w join rel r on lower(r.name) = w.word
+    where not (w.kind = 'r' and r.name = w.name)
+  )
+  select jsonb_build_object(
+    'edges', (
+      select coalesce(jsonb_object_agg(b.kind || ':' || b.name, coalesce(e.targets, '[]'::jsonb)), '{}'::jsonb)
+      from body b left join (select x.kind, x.name, jsonb_agg(x.target order by x.target) as targets from edges x group by 1, 2) e
+        on e.kind = b.kind and e.name = b.name),
+    'opaque', (select coalesce(jsonb_agg(f.name order by f.name), '[]'::jsonb) from fn f where f.opaque));
 $function$;
 
 -- Which migrations the database has, from Supabase's ledger; empty when there is none.
@@ -801,13 +885,18 @@ begin
 end;
 $function$;
 
-create or replace function public.ghost_log_entries(p_session text)
+-- The entries past p_after, and how many the session has in all: a server that keeps the log fetches only what's new,
+-- and a total that doesn't add up (a reset, or an entry that committed below the newest seq) makes it read it whole.
+drop function if exists public.ghost_log_entries(text);
+create or replace function public.ghost_log_entries(p_session text, p_after bigint default 0)
 returns jsonb language sql stable security definer set search_path = '' as $function$
   select jsonb_build_object(
     'startedAt', (select s.started_at from ghost.sessions s where s.id = p_session and s.last_seen_at > now() - interval '12 hours'),
     'entries', coalesce((select jsonb_agg(jsonb_build_object('seq', e.seq, 'at', e.at, 'kind', e.kind, 'entry', e.entry) order by e.seq)
       from ghost.entries e join ghost.sessions s on s.id = e.session_id
-      where e.session_id = p_session and s.last_seen_at > now() - interval '12 hours'), '[]'::jsonb));
+      where e.session_id = p_session and e.seq > p_after and s.last_seen_at > now() - interval '12 hours'), '[]'::jsonb),
+    'total', (select count(*) from ghost.entries e join ghost.sessions s on s.id = e.session_id
+      where e.session_id = p_session and s.last_seen_at > now() - interval '12 hours'));
 $function$;
 
 create or replace function public.ghost_log_reset(p_session text)
@@ -831,7 +920,8 @@ revoke all on function
   ghost.filter_sql(text, jsonb, text), ghost.call_rpc(text, jsonb), ghost.table_write(jsonb), ghost.table_read(jsonb),
   ghost.deferred_checks(), ghost.branch_migrations(jsonb), ghost.open_run(jsonb, jsonb, boolean, jsonb), ghost.close_run(),
   public.ghost_run(jsonb, jsonb), public.ghost_read(jsonb, jsonb), public.ghost_relations(), public.ghost_applied_migrations(),
-  public.ghost_log_add(text, text, jsonb), public.ghost_log_entries(text), public.ghost_log_reset(text), public.ghost_log_end(text)
+  public.ghost_read_functions(), public.ghost_read_reach(),
+  public.ghost_log_add(text, text, jsonb), public.ghost_log_entries(text, bigint), public.ghost_log_reset(text), public.ghost_log_end(text)
   from public;
 
 do $grants$
@@ -841,13 +931,15 @@ begin
   foreach r in array array['anon', 'authenticated'] loop
     if exists (select 1 from pg_catalog.pg_roles where rolname = r) then
       execute pg_catalog.format('revoke all on function public.ghost_run(jsonb, jsonb), public.ghost_read(jsonb, jsonb), '
-        || 'public.ghost_relations(), public.ghost_applied_migrations(), public.ghost_log_add(text, text, jsonb), '
-        || 'public.ghost_log_entries(text), public.ghost_log_reset(text), public.ghost_log_end(text) from %I', r);
+        || 'public.ghost_relations(), public.ghost_applied_migrations(), public.ghost_read_functions(), public.ghost_read_reach(), '
+        || 'public.ghost_log_add(text, text, jsonb), '
+        || 'public.ghost_log_entries(text, bigint), public.ghost_log_reset(text), public.ghost_log_end(text) from %I', r);
     end if;
   end loop;
   if exists (select 1 from pg_catalog.pg_roles where rolname = 'service_role') then
     grant execute on function public.ghost_run(jsonb, jsonb), public.ghost_read(jsonb, jsonb), public.ghost_relations(),
-      public.ghost_applied_migrations(), public.ghost_log_add(text, text, jsonb), public.ghost_log_entries(text),
+      public.ghost_applied_migrations(), public.ghost_read_functions(), public.ghost_read_reach(),
+      public.ghost_log_add(text, text, jsonb), public.ghost_log_entries(text, bigint),
       public.ghost_log_reset(text), public.ghost_log_end(text) to service_role;
   end if;
 end;

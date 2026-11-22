@@ -46,8 +46,9 @@ export class BranchTurns {
       if (!p.heavy.length || !p.sql) continue
       seen.add(p.file)
       if (this.turns.get(p.file)?.sql === p.sql) continue
-      this.turns.set(p.file, { file: p.file, heavy: p.heavy[0]!, sql: p.sql, state: "waiting", tries: 0, nextAt: this.now(), message: null })
-      this.later(() => void this.attempt(p.file), 0)
+      const turn = { file: p.file, heavy: p.heavy[0]!, sql: p.sql, state: "waiting" as const, tries: 0, nextAt: this.now(), message: null }
+      this.turns.set(p.file, turn)
+      this.later(() => void this.attempt(turn), 0)
     }
     for (const file of this.turns.keys()) if (!seen.has(file)) this.turns.delete(file)
   }
@@ -57,7 +58,7 @@ export class BranchTurns {
     const turn = this.turns.get(file)
     if (!turn || turn.state === "waiting") return
     Object.assign(turn, { state: "waiting", tries: 0, nextAt: this.now(), message: null })
-    this.later(() => void this.attempt(file), 0)
+    this.later(() => void this.attempt(turn), 0)
   }
 
   status(): Turn[] {
@@ -72,9 +73,10 @@ export class BranchTurns {
     return `Ghost is waiting for a turn on ${turn.heavy.table} for ${file}: ${heavyNotice(turn.heavy)}. It keeps trying in the background; try again in a moment.`
   }
 
-  private async attempt(file: string): Promise<void> {
-    const turn = this.turns.get(file)
-    if (!turn || turn.state !== "waiting") return
+  /** One try for this turn. A timer from a turn the file has since replaced (it was edited) does nothing. */
+  private async attempt(turn: Turn & { sql: string }): Promise<void> {
+    const file = turn.file
+    if (this.turns.get(file) !== turn || turn.state !== "waiting") return
     const upTo = this.payload.slice(0, this.payload.findIndex((p) => p.file === file) + 1)
     let error: { code?: string; message?: string } | null
     try {
@@ -94,7 +96,7 @@ export class BranchTurns {
     } else {
       const wait = Math.min(this.options.capMs, this.options.baseMs * 2 ** (turn.tries - 1))
       turn.nextAt = this.now() + wait
-      this.later(() => void this.attempt(file), wait)
+      this.later(() => void this.attempt(turn), wait)
     }
   }
 }

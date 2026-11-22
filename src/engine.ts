@@ -8,6 +8,7 @@ import { sessionSummary, type GhostLog } from "./log/types.js"
 import { migrationPayload, type BranchMigrations, type LedgerRow } from "./migrations.js"
 import { migrationLoader, type MigrationSource } from "./migrations-node.js"
 import { bodySummary, DEFAULT_ALLOWED_HOSTS, isOutboundWrite, type HostRule } from "./outbound.js"
+import { reaches, type ReadReach, type Reaches } from "./reach.js"
 import { ghostRead, type Dispatch, type Relations } from "./run.js"
 import { deleteGhostObjects, ghostStorage, sessionStorage, storageBuckets } from "./storage.js"
 import { BranchTurns, failedMigration, ghostStatusText, isNoTurn } from "./turns.js"
@@ -93,6 +94,30 @@ export function createGhost(options: GhostOptions): Ghost {
     return relationsCache.value
   }
 
+  let readFunctionsCache: { at: number; value: Promise<ReadonlySet<string>> } | null = null
+  const readFunctions = () => {
+    if (!readFunctionsCache || Date.now() - readFunctionsCache.at > RELATIONS_TTL_MS) {
+      const value = (call("ghost_read_functions", {}) as Promise<string[]>).then((names) => new Set(names))
+      value.catch(() => { readFunctionsCache = null })
+      readFunctionsCache = { at: Date.now(), value }
+    }
+    return readFunctionsCache.value
+  }
+
+  // The map takes a moment to build, so no read waits for it: until it has loaded (and while a newer one loads) reads
+  // go by what is already here, which at first is nothing, and nothing means replay.
+  const reachCache: { at: number; loading: boolean; value: Reaches | null } = { at: 0, loading: false, value: null }
+  const reach = () => {
+    if (!reachCache.loading && Date.now() - reachCache.at > RELATIONS_TTL_MS) {
+      reachCache.loading = true
+      void (call("ghost_read_reach", {}) as Promise<ReadReach>)
+        .then((map) => { reachCache.value = reaches(map) })
+        .catch((error) => console.error("[ghost] read reach", error))
+        .finally(() => { reachCache.at = Date.now(); reachCache.loading = false })
+    }
+    return reachCache.value
+  }
+
   const loadBranch = options.migrations
     ? migrationLoader(options.migrations, {
       ledger: async () => (await call("ghost_applied_migrations", {})) as LedgerRow[],
@@ -151,7 +176,8 @@ export function createGhost(options: GhostOptions): Ghost {
       return Response.json({}, { status: 200 })
     }
     if (!READS.has(method)) {
-      const engine: WriteEngine = { dispatch, relations, real: (r) => realSend(r), functions, inSession: (fn) => session.run(fn) }
+      const engine: WriteEngine = { dispatch, relations, real: (r) => realSend(r), functions, inSession: (fn) => session.run(fn),
+        readFunctions, reach, unbranched: async () => migrationPayload(await branch()).length === 0 }
       return ghostDatabaseWrite(request, session.log, engine)
     }
     if (url.pathname.startsWith("/storage/v1/")) return (await ghostStorage(request, session.log, (r) => realSend(r))) ?? realSend(request)
@@ -159,8 +185,8 @@ export function createGhost(options: GhostOptions): Ghost {
       const [changes, found] = await Promise.all([sessionChanges(session.log), branch()])
       const pending = migrationPayload(found).length > 0
       if (changes.length || pending) {
-        const answer = await ghostRead(request, changes, await relations(), dispatch, () => realSend(new Request(request)),
-          pending ? { tables: new Set(found!.createdTables) } : null)
+        const answer = await ghostRead(request, changes, await relations(), dispatch, (asked) => realSend(asked ?? new Request(request)),
+          pending ? { tables: new Set(found!.createdTables) } : null, reach())
         if (answer) return answer
       }
     }
@@ -208,12 +234,29 @@ export function createGhost(options: GhostOptions): Ghost {
       const scope = globalThis as typeof globalThis & { [GUARD]?: true }
       if (scope[GUARD]) return
       scope[GUARD] = true
-      const original = globalThis.fetch.bind(globalThis)
-      globalThis.fetch = (input, init) => {
-        const current = sessionScope.getStore()
-        if (!current || realScope.getStore()) return original(input, init)
-        return current.fetch(input, init)
+      const guarded = new WeakSet<typeof fetch>()
+      const wrap = (original: typeof fetch): typeof fetch => {
+        const guard: typeof fetch = (input, init) => {
+          const current = sessionScope.getStore()
+          if (!current || realScope.getStore()) return original(input, init)
+          return current.fetch(input, init)
+        }
+        guarded.add(guard)
+        return guard
       }
+      let current = wrap(globalThis.fetch.bind(globalThis))
+      // A framework that puts back the fetch it saved at startup (Next's dev server does, after every change) would
+      // drop the guard, and a session's writes would go out for real. So a fetch assigned later is guarded again,
+      // unless it already is: Next's own re-patch wraps the guarded fetch it just read.
+      Object.defineProperty(globalThis, "fetch", {
+        configurable: true,
+        enumerable: true,
+        get: () => current,
+        set: (next: typeof fetch & { __nextPatched?: boolean }) => {
+          if (next.__nextPatched) guarded.add(next)
+          current = guarded.has(next) ? next : wrap(next)
+        },
+      })
     },
     branch,
     async status() {

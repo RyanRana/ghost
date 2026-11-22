@@ -1,6 +1,7 @@
 import type { GhostLog, GhostWriteKind, NewWrite } from "./log/types.js"
 import type { GhostRowChange } from "./patch.js"
-import { writeRequest, writeResponse, type Dispatch, type Relations } from "./run.js"
+import type { Reaches } from "./reach.js"
+import { seesSession, writeRequest, writeResponse, type Dispatch, type Relations } from "./run.js"
 import { ghostStorage } from "./storage.js"
 
 /** An edge function's own code, run in-process instead of the deployed copy. Its fetches come back through ghost. */
@@ -14,6 +15,12 @@ export interface WriteEngine {
   functions: Record<string, EdgeFunction>
   /** Runs code as this session, so the global guard (when installed) ghosts what it sends. */
   inSession: <T>(run: () => Promise<T>) => Promise<T>
+  /** The RPCs the database says cannot write (every overload STABLE or IMMUTABLE): run as reads. */
+  readFunctions?: () => Promise<ReadonlySet<string>>
+  /** No branch migrations are pending, so a read the session can't have touched may be answered live. */
+  unbranched?: () => Promise<boolean>
+  /** What each function can read, once that has loaded; null until then. */
+  reach?: () => Reaches | null
 }
 
 export async function sessionChanges(log: GhostLog): Promise<GhostRowChange[]> {
@@ -53,6 +60,8 @@ export function describeWrite(request: Request, body: string | null): NewWrite |
     const value = request.headers.get(name)
     if (value) headers[name] = value
   }
+  // Realtime's broadcast puts the key in the query string; the log must never keep it.
+  if (url.searchParams.has("apikey")) url.searchParams.set("apikey", "redacted")
   return { ...target, method: request.method, path: url.pathname + url.search, headers, body: target.kind === "storage" ? null : body }
 }
 
@@ -103,7 +112,13 @@ async function runForReal(request: Request, write: NewWrite, log: GhostLog, engi
     await keep(log, write)
     return Response.json({ code: "0A000", message: planned.refuse, details: null, hint: null }, { status: 400 })
   }
-  const answer = await engine.dispatch("ghost_run", await sessionChanges(log), planned.request)
+  const reads = write.kind === "rpc" && !!(await engine.readFunctions?.().catch(() => null))?.has(write.target)
+  const changes = await sessionChanges(log)
+  // A function that cannot write reads exactly what live reads when the session changed nothing it can reach. PostgREST
+  // runs a STABLE or IMMUTABLE function in a read-only transaction, so even a mislabeled one can't save anything.
+  if (reads && !(changes.length && seesSession(engine.reach?.()?.("function", write.target), changes))
+    && await engine.unbranched?.().catch(() => false)) return engine.real(request)
+  const answer = await engine.dispatch(reads ? "ghost_read" : "ghost_run", changes, planned.request)
   // An RPC that changed nothing was a read: nothing to keep.
   if (answer.changes?.length || (write.kind === "table" && !answer.error)) await keep(log, { ...write, changes: answer.changes ?? [] })
   return writeResponse(request, answer)
